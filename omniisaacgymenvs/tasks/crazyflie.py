@@ -47,7 +47,10 @@ class CrazyflieTask(RLTask):
         self._num_observations = 18
         self._num_actions = 4
 
-        self._crazyflie_position = torch.tensor([0, 0, 1.0])
+        # Spawn the Crazyflie close to the floor so that the policy has to generate
+        # thrust to lift off and reach the hover target.
+        self._crazyflie_position = torch.tensor([0, 0, 0.05])
+        # Visual target showing the desired hover position.
         self._ball_position = torch.tensor([0, 0, 1.0])
 
         RLTask.__init__(self, name=name, env=env)
@@ -261,7 +264,7 @@ class CrazyflieTask(RLTask):
         self.prop_max_rot = 433.3
 
         self.target_positions = torch.zeros((self._num_envs, 3), device=self._device, dtype=torch.float32)
-        self.target_positions[:, 2] = 1
+        self.target_positions[:, 2] = 1.0
         self.actions = torch.zeros((self._num_envs, 4), device=self._device, dtype=torch.float32)
 
         self.all_indices = torch.arange(self._num_envs, dtype=torch.int32, device=self._device)
@@ -299,9 +302,9 @@ class CrazyflieTask(RLTask):
     def set_targets(self, env_ids):
         num_sets = len(env_ids)
         envs_long = env_ids.long()
-        # set target position randomly with x, y in (0, 0) and z in (2)
+        # Hover target is directly above the take-off point at 1 m height.
         self.target_positions[envs_long, 0:2] = torch.zeros((num_sets, 2), device=self._device)
-        self.target_positions[envs_long, 2] = torch.ones(num_sets, device=self._device) * 2.0
+        self.target_positions[envs_long, 2] = torch.ones(num_sets, device=self._device) * 1.0
 
         # shift the target up so it visually aligns better
         ball_pos = self.target_positions[envs_long] + self._env_pos[envs_long]
