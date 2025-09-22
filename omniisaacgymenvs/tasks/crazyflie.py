@@ -14,12 +14,14 @@ from omni.isaac.core.utils.prims import get_prim_at_path
 from omni.isaac.core.utils.torch.rotations import *  # quat_axis, etc.
 
 from omniisaacgymenvs.tasks.base.rl_task import RLTask
-from omniisaacgymenvs.utils.torch import torch_rand_float
 from omniisaacgymenvs.robots.articulations.crazyflie import Crazyflie
 from omniisaacgymenvs.robots.articulations.views.crazyflie_view import CrazyflieView
 
 EPS = 1e-6  # small constant to avoid divisions by zero
 
+def torch_rand_float(low, high, shape, device):
+    """Uniform random tensor in [low, high] with the given shape on device."""
+    return (high - low) * torch.rand(shape, device=device, dtype=torch.float32) + low
 
 class CrazyflieTask(RLTask):
     def __init__(self, name, sim_config, env, offset=None) -> None:
@@ -31,7 +33,7 @@ class CrazyflieTask(RLTask):
         self._num_actions = 4
 
         # Spawn close to the floor so the agent must generate thrust to lift.
-        self._crazyflie_position = torch.tensor([0.0, 0.0, 0.05])
+        self._crazyflie_position = torch.tensor([0.0, 0.0, 0.20])
         # Visual target at 1.0 m above the takeoff point.
         self._ball_position = torch.tensor([0.0, 0.0, 1.0])
 
@@ -53,11 +55,11 @@ class CrazyflieTask(RLTask):
         # Crazyflie physical-ish parameters (simplified)
         self.arm_length = 0.05
         self.mass = 0.028  # kg
-        self.thrust_to_weight = 1.9  # scale for max thrust relative to weight
+        self.thrust_to_weight = 3.0  # scale for max thrust relative to weight
 
         # Motor first-order lag (s)
-        self.motor_damp_time_up = 0.15
-        self.motor_damp_time_down = 0.15
+        self.motor_damp_time_up = 0.05
+        self.motor_damp_time_down = 0.05
 
         # Convert to per-step blend factors (0..1), approx 4 time constants to settle
         self.motor_tau_up = 4.0 * self.dt / (self.motor_damp_time_up + EPS)
