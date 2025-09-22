@@ -339,39 +339,49 @@ class CrazyflieTask(RLTask):
     def calculate_metrics(self) -> None:
         root_positions = self.root_pos - self._env_pos
         root_quats = self.root_rot
-        root_angvels = self.root_velocities[:, 3:]
+        root_vels = self.root_velocities
+        root_angvels = root_vels[:, 3:]
 
-        # Distance to hover target
+        # Distance to full 3D target (used for general closeness)
         target_dist = torch.sqrt(torch.square(self.target_positions - root_positions).sum(-1))
         pos_reward = 1.0 / (1.0 + target_dist)
 
-        # Uprightness (world Z dot body Z)
+        # Uprightness (world Z ⋅ body Z)
         ups = quat_axis(root_quats, 2)
         up_reward = torch.clamp(ups[..., 2], 0.0, 1.0)
 
         # Effort (action magnitude)
         effort = torch.square(self.actions).sum(-1)
 
-        # Angular rate penalty proxy (smaller is better)
+        # Angular rate (smaller is better)
         spin = torch.square(root_angvels).sum(-1)
 
-        # Save for is_done and logging
+        pos_err_xy = self.target_positions[:, :2] - root_positions[:, :2]    # [E,2]
+        dist_xy = torch.norm(pos_err_xy, dim=-1)                              # [E]
+        vel_xy = torch.norm(root_vels[:, :2], dim=-1)                         # [E]
+
+        pos_xy_reward = torch.exp(-2.0 * dist_xy)  # strong pull to XY target
+        vel_xy_pen = vel_xy                        # discourage lateral sliding
+
+        # Save values for terminations/logging
         self.target_dist = target_dist
         self.root_positions = root_positions
         self.orient_z = ups[..., 2]
 
-        # Clear, additive shaping (good for early learning)
+        # Clear, additive shaping (tweak weights to taste)
         self.rew_buf[:] = (
-            2.0 * pos_reward
-            + 0.5 * up_reward
-            + 0.2 * torch.exp(-1.0 * spin)
-            - 0.01 * effort
+            1.5 * pos_reward            # overall closeness in 3D
+        + 1.0 * pos_xy_reward         # explicit XY station-keeping
+        + 0.6 * up_reward             # stay upright
+        + 0.2 * torch.exp(-1.0 * spin)# low angular rates
+        - 0.02 * vel_xy_pen           # damp sideways drift
+        - 0.01 * effort               # keep thrust modest
         )
 
-        # Episode sums
+        # Episode logs
         self.episode_sums["rew_pos"] += pos_reward
         self.episode_sums["rew_orient"] += up_reward
-        self.episode_sums["rew_effort"] += torch.exp(-0.5 * effort)  # keep as a separate log if you like
+        self.episode_sums["rew_effort"] += torch.exp(-0.5 * effort)
         self.episode_sums["rew_spin"] += torch.exp(-1.0 * spin)
 
         self.episode_sums["raw_dist"] += target_dist
@@ -387,7 +397,7 @@ class CrazyflieTask(RLTask):
         die = torch.where(self.target_dist > 5.0, ones, die)
 
         # Gentler floor early on so it has time to lift
-        grace = self.progress_buf < int(1.5 / self.dt)  # ~1.5 s
+        grace = self.progress_buf < int(1.5 / self.dt)  # ~1.5 s at dt=0.01
         low_floor_now = self.root_positions[..., 2] < 0.0
         low_floor_later = self.root_positions[..., 2] < 0.5
 
@@ -397,6 +407,10 @@ class CrazyflieTask(RLTask):
         # Too high or upside down
         die = torch.where(self.root_positions[..., 2] > 5.0, ones, die)
         die = torch.where(self.orient_z < 0.0, ones, die)
+
+        # NEW: gentle radial XY boundary (prevents unbounded slow drift)
+        xy_radius = torch.norm(self.root_positions[..., :2], dim=-1)
+        die = torch.where(xy_radius > 2.0, ones, die)   # 2 m radius; adjust as needed
 
         # Episode length timeout
         self.reset_buf[:] = torch.where(self.progress_buf >= self._max_episode_length - 1, ones, die)
