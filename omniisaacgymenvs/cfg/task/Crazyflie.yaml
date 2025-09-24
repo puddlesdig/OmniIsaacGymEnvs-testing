@@ -7,14 +7,13 @@ physics_engine: ${..physics_engine}
 env:
   # Defaults to CLI override (num_envs); otherwise falls back to 4096.
   numEnvs: ${resolve_default:4096,${...num_envs}}
-  # spacing between envs in the grid
+  # spacing between envs in the grid (avoid cross-coupling in large batches)
   envSpacing: 2.5
-  # length of an episode in simulation steps (dt*steps seconds)
-  # 1000 @ dt=0.01 → 10 seconds (gives the agent time to lift and stabilize)
-  maxEpisodeLength: 1000
+  # episode length in steps; 1200 @ dt=0.01 → 12 s (extra time for takeoff + dwell)
+  maxEpisodeLength: 1500
   enableDebugVis: False
 
-  # Clamp observations/actions fed to the policy (safety + stability)
+  # Clamp observations/actions to keep training stable
   clipObservations: 5.0
   clipActions: 1.0
 
@@ -33,7 +32,7 @@ sim:
   disable_contact_processing: False
 
   physx:
-    # threads/solver type come from the parent (e.g., physx defaults)
+    # threads/solver from parent (CLI or default)
     num_threads: ${....num_threads}
     solver_type: ${....solver_type}
     # run PhysX on GPU if sim_device=cuda:0 (pass via CLI)
@@ -49,7 +48,7 @@ sim:
     enable_sleeping: True
     enable_stabilization: False
 
-    # GPU buffer sizes (defaults from the original file; keep generous for many envs)
+    # GPU buffers (generous defaults for many envs)
     gpu_max_rigid_contact_count: 524288
     gpu_max_rigid_patch_count: 81920
     gpu_found_lost_pairs_capacity: 4194304
@@ -61,7 +60,7 @@ sim:
     gpu_temp_buffer_capacity: 16777216
     gpu_max_num_partitions: 8
 
-  # Per-actor simulation overrides (optional; keep as in the stock config)
+  # Per-actor overrides
 
   crazyflie:
     # -1 to use USD defaults
