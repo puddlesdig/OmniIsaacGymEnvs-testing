@@ -8,7 +8,7 @@ import torch
 from omni.isaac.core.objects import DynamicSphere
 from omni.isaac.core.prims import RigidPrimView
 from omni.isaac.core.utils.prims import get_prim_at_path
-from omni.isaac.core.utils.torch.rotations import *  # quat_axis, quat_to_euler, etc.
+from omni.isaac.core.utils.torch.rotations import *  # quat_axis, quat_to_euler
 
 from omniisaacgymenvs.tasks.base.rl_task import RLTask
 from omniisaacgymenvs.robots.articulations.crazyflie import Crazyflie
@@ -25,12 +25,9 @@ class CrazyflieTask(RLTask):
     def __init__(self, name, sim_config, env, offset=None) -> None:
         self.update_config(sim_config)
 
-        # obs = [pos_err(3), body_axes(9), lin_vel(3), ang_vel(3)]
-        self._num_observations = 18
-        # actions = 4 motor thrust fractions
-        self._num_actions = 4
+        self._num_observations = 18   # [pos_err(3), body_axes(9), lin_vel(3), ang_vel(3)]
+        self._num_actions = 4         # 4 motors
 
-        # spawn near floor; target at z=1.0
         self._crazyflie_position = torch.tensor([0.0, 0.0, 0.20])
         self._ball_position = torch.tensor([0.0, 0.0, 1.0])
 
@@ -47,25 +44,33 @@ class CrazyflieTask(RLTask):
         self._max_episode_length = self._task_cfg["env"]["maxEpisodeLength"]
         self.dt = self._task_cfg["sim"]["dt"]
 
-        # simplified CF params
-        self.arm_length = 0.05
-        self.mass = 0.028
-        self.thrust_to_weight = 3.0
+        # near-Crazyflie params
+        self.arm_length = 0.046
+        self.mass = 0.027
+        self.thrust_to_weight = 2.0
 
-        # motor first-order lag (sec)
-        self.motor_damp_time_up = 0.05
-        self.motor_damp_time_down = 0.05
-
-        # per-step blend (~4T to settle)
+        # motor lag (slower → smoother) — slightly faster than before to allow corrections
+        self.motor_damp_time_up = 0.08     # was 0.12
+        self.motor_damp_time_down = 0.10   # was 0.15
         self.motor_tau_up = 4.0 * self.dt / (self.motor_damp_time_up + EPS)
         self.motor_tau_down = 4.0 * self.dt / (self.motor_damp_time_down + EPS)
 
         # nominal motor asymmetry (sum=4)
-        self.motor_assymetry = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+        self.motor_assymetry = np.array([1.00, 0.98, 1.02, 1.00], dtype=np.float32)
         self.motor_assymetry = self.motor_assymetry * 4.0 / np.sum(self.motor_assymetry)
 
-        # |gravity|
         self.grav_z = -1.0 * float(self._task_cfg["sim"]["gravity"][2])
+
+        # rate limit (in raw [-1,1] space) — loosened a bit
+        self.max_action_delta = 0.10  # was 0.06
+
+        # output filter + HF penalty params
+        self.filter_alpha = 0.5       # was 0.7 (less smoothing so it can correct down)
+        self.hist_len = 16            # steps kept for HF penalty
+        self.hf_penalty_enabled = False  # enable later after hover is stable
+
+        # curriculum / randomization toggles
+        self.enable_domain_rand = False  # enable after baseline hover success > 70%
 
     # ------------------------------ scene -------------------------------- #
     def set_up_scene(self, scene) -> None:
@@ -109,7 +114,6 @@ class CrazyflieTask(RLTask):
         )
 
     def get_target(self):
-        # visual waypoint only
         radius = 0.2
         color = torch.tensor([1.0, 0.0, 0.0])  # RGB only
         ball = DynamicSphere(
@@ -136,15 +140,23 @@ class CrazyflieTask(RLTask):
         rot_y = quat_axis(root_quats, 1)
         rot_z = quat_axis(root_quats, 2)
 
-        root_linvels = self.root_velocities[:, :3]
-        root_angvels = self.root_velocities[:, 3:]
+        # simple 1-step IMU delay + noise
+        if not hasattr(self, "_obs_delay_buf"):
+            self._obs_delay_buf = {
+                "lin": torch.zeros_like(self.root_velocities[:, :3]),
+                "ang": torch.zeros_like(self.root_velocities[:, 3:]),
+            }
+        lin_meas = self._obs_delay_buf["lin"]
+        ang_meas = self._obs_delay_buf["ang"]
+        self._obs_delay_buf["lin"] = self.root_velocities[:, :3] + 0.02 * torch.randn_like(self.root_velocities[:, :3])
+        self._obs_delay_buf["ang"] = self.root_velocities[:, 3:] + 0.02 * torch.randn_like(self.root_velocities[:, 3:])
 
         self.obs_buf[..., 0:3] = self.target_positions - root_positions
         self.obs_buf[..., 3:6] = rot_x
         self.obs_buf[..., 6:9] = rot_y
         self.obs_buf[..., 9:12] = rot_z
-        self.obs_buf[..., 12:15] = root_linvels
-        self.obs_buf[..., 15:18] = root_angvels
+        self.obs_buf[..., 12:15] = lin_meas
+        self.obs_buf[..., 15:18] = ang_meas
 
         return {self._copters.name: {"obs_buf": self.obs_buf}}
 
@@ -162,30 +174,69 @@ class CrazyflieTask(RLTask):
             self.set_targets(set_target_ids)
 
         actions = actions.clone().to(self._device)
-        self.action_diff = (actions - self.prev_actions)  # for smoothness
-        self.prev_actions = actions.clone()
-        self.actions = actions
 
-        # clamp [-1,1] → [0,1]
-        thrust_cmds = torch.clamp(actions, -1.0, 1.0)
-        thrust_cmds = (thrust_cmds + 1.0) / 2.0
+        # rate limit in [-1,1]
+        if not hasattr(self, "prev_raw_actions"):
+            self.prev_raw_actions = torch.zeros_like(actions)
+        raw = torch.clamp(actions, -1.0, 1.0)
+        delta = torch.clamp(raw - self.prev_raw_actions,
+                            -2 * self.max_action_delta, 2 * self.max_action_delta)
+        raw = self.prev_raw_actions + delta
+        self.prev_raw_actions = raw.clone()
 
-        # motor lag
+        # smoothness terms use post-limited actions
+        self.action_diff = (raw - getattr(self, "prev_actions", torch.zeros_like(raw)))
+        self.prev_actions = raw.clone()
+        self.actions = raw
+
+        # --- Hover-referenced thrust mapping ---
+        # policy outputs raw in [-1,1]; map to a delta around per-env hover
+        if not hasattr(self, "u_hover_frac"):
+            # Fallback before post_reset computes it
+            self.u_hover_frac = torch.full((self._num_envs,), 0.5, device=self._device, dtype=torch.float32)
+        u_hover = self.u_hover_frac.unsqueeze(1).expand(-1, 4)  # [E,4]
+        delta = 0.25 * u_hover * raw                             # +/-25% of hover thrust
+        thrust_cmds = torch.clamp(u_hover + delta, 0.0, 1.0)
+        # --------------------------------------
+
+        # first-order motor lag in sqrt space
+        if not hasattr(self, "thrust_rot_damp"):
+            self.thrust_rot_damp = torch.zeros((self._num_envs, 4), dtype=torch.float32, device=self._device)
+        if not hasattr(self, "thrust_cmds_damp"):
+            self.thrust_cmds_damp = torch.zeros((self._num_envs, 4), dtype=torch.float32, device=self._device)
+
         motor_tau = self.motor_tau_up * torch.ones((self._num_envs, 4), dtype=torch.float32, device=self._device)
         motor_tau[thrust_cmds < self.thrust_cmds_damp] = self.motor_tau_down
         motor_tau = torch.clamp(motor_tau, 0.0, 1.0)
 
-        # lag in sqrt space
         thrust_rot = torch.sqrt(thrust_cmds)
         self.thrust_rot_damp = motor_tau * (thrust_rot - self.thrust_rot_damp) + self.thrust_rot_damp
         self.thrust_cmds_damp = self.thrust_rot_damp ** 2
 
         # small noise
-        thrust_noise = 0.01 * torch.randn(self._num_envs, 4, dtype=torch.float32, device=self._device)
-        self.thrust_cmds_damp = torch.clamp(self.thrust_cmds_damp + thrust_cmds * thrust_noise, 0.0, 1.0)
+        self.thrust_cmds_damp = torch.clamp(
+            self.thrust_cmds_damp + thrust_cmds * (0.01 * torch.randn_like(self.thrust_cmds_damp)), 0.0, 1.0
+        )
+
+        # low-pass filter on commands (reduces twitch)
+        if not hasattr(self, "filtered_thrust"):
+            self.filtered_thrust = self.thrust_cmds_damp.clone()
+        self.filtered_thrust = self.filter_alpha * self.filtered_thrust + (1.0 - self.filter_alpha) * self.thrust_cmds_damp
+
+        # 1-step actuation delay (use previous filtered command)
+        if not hasattr(self, "applied_cmd"):
+            self.applied_cmd = self.filtered_thrust.clone()
+        cmd_for_step = self.applied_cmd
+        self.applied_cmd = self.filtered_thrust.clone()
+
+        # keep short history for HF penalty
+        if not hasattr(self, "thrust_hist"):
+            self.thrust_hist = torch.zeros((self.hist_len, self._num_envs, 4), device=self._device, dtype=torch.float32)
+        self.thrust_hist = torch.roll(self.thrust_hist, shifts=1, dims=0)
+        self.thrust_hist[0] = cmd_for_step.detach()
 
         # thrusts [E,4]
-        thrusts = self.thrust_max * self.thrust_cmds_damp  # per-env randomized max
+        thrusts = self.thrust_max * cmd_for_step
 
         # rotate to world frame
         root_quats = self.root_rot
@@ -194,6 +245,8 @@ class CrazyflieTask(RLTask):
         rot_z = quat_axis(root_quats, 2)
         rot_matrix = torch.cat((rot_x, rot_y, rot_z), dim=1).reshape(-1, 3, 3)
 
+        if not hasattr(self, "thrusts"):
+            self.thrusts = torch.zeros((self._num_envs, 4, 3), dtype=torch.float32, device=self._device)
         force_xy = torch.zeros(self._num_envs, 4, 2, dtype=torch.float32, device=self._device)
         thrusts_3d = torch.cat((force_xy, thrusts.view(-1, 4, 1)), dim=2)
 
@@ -205,7 +258,9 @@ class CrazyflieTask(RLTask):
             self.thrusts[reset_env_ids] = 0.0
 
         # rotor visuals
-        prop_rot = self.thrust_cmds_damp * self.prop_max_rot
+        if not hasattr(self, "dof_vel"):
+            self.dof_vel = self._copters.get_joint_velocities()
+        prop_rot = cmd_for_step * 433.3
         self.dof_vel[:, 0] = prop_rot[:, 0]
         self.dof_vel[:, 1] = -prop_rot[:, 1]
         self.dof_vel[:, 2] = prop_rot[:, 2]
@@ -216,36 +271,57 @@ class CrazyflieTask(RLTask):
         for i in range(4):
             self._copters.physics_rotors[i].apply_forces(self.thrusts[:, i], indices=self.all_indices)
 
+        # light aero damping
+        lin = self.root_velocities[:, :3]
+        ang = self.root_velocities[:, 3:]
+        lin_damp = -0.02 * lin
+        ang_damp = -0.002 * ang
+        if hasattr(self._copters, "apply_base_external_forces"):
+            self._copters.apply_base_external_forces(lin_damp)
+        if hasattr(self._copters, "apply_base_external_torques"):
+            self._copters.apply_base_external_torques(ang_damp)
+
     # ---------------------------- reset & init --------------------------- #
     def post_reset(self):
-        # per-env motor asymmetry randomization (sum=4)
-        asym = 1.0 + 0.05 * torch.randn(self._num_envs, 4, device=self._device)
-        asym = torch.clamp(asym, 0.8, 1.2)
-        asym = 4.0 * (asym / (torch.sum(asym, dim=1, keepdim=True) + EPS))
-        self.motor_asym_env = asym  # [E,4]
+        # per-env motor asymmetry / mass / T/W
+        if self.enable_domain_rand:
+            asym = 1.0 + 0.05 * torch.randn(self._num_envs, 4, device=self._device)
+            asym = torch.clamp(asym, 0.8, 1.2)
+            asym = 4.0 * (asym / (torch.sum(asym, dim=1, keepdim=True) + EPS))
+            mass_env = self.mass * torch.clamp(1.0 + 0.10 * torch.randn(self._num_envs, device=self._device), 0.9, 1.1)
+            ttw_env = self.thrust_to_weight * torch.clamp(1.0 + 0.15 * torch.randn(self._num_envs, device=self._device), 0.7, 1.3)
+        else:
+            asym = torch.ones(self._num_envs, 4, device=self._device)
+            mass_env = torch.full((self._num_envs,), self.mass, device=self._device)
+            ttw_env = torch.full((self._num_envs,), self.thrust_to_weight, device=self._device)
+        self.motor_asym_env = asym
 
-        # per-env thrust max (N)
-        # randomize thrust_to_weight ±15%, mass ±10%
-        mass_env = self.mass * torch.clamp(1.0 + 0.10 * torch.randn(self._num_envs, device=self._device), 0.9, 1.1)
-        ttw_env = self.thrust_to_weight * torch.clamp(1.0 + 0.15 * torch.randn(self._num_envs, device=self._device), 0.7, 1.3)
         thrust_max_env = (self.grav_z * mass_env * ttw_env).unsqueeze(-1) * (self.motor_asym_env / 4.0)
-        self.thrust_max = thrust_max_env.to(torch.float32)  # [E,4]
+        self.thrust_max = thrust_max_env.to(torch.float32)
+
+        # per-env hover fraction of max command (sum over motors)
+        total_thrust_max = torch.sum(self.thrust_max, dim=1)  # [E,3] per motor vector? wait: thrust_max is scalar per motor along z
+        # thrust_max is scalar magnitude per motor (not 3D). Sum over motor magnitudes:
+        total_thrust_max_scalar = torch.sum(self.thrust_max.squeeze(-1), dim=1)  # [E]
+        self.u_hover_frac = (self.mass * self.grav_z) / (total_thrust_max_scalar + 1e-6)
+        self.u_hover_frac = torch.clamp(self.u_hover_frac, 0.35, 0.65)
 
         self.thrusts = torch.zeros((self._num_envs, 4, 3), dtype=torch.float32, device=self._device)
         self.thrust_cmds_damp = torch.zeros((self._num_envs, 4), dtype=torch.float32, device=self._device)
         self.thrust_rot_damp = torch.zeros((self._num_envs, 4), dtype=torch.float32, device=self._device)
-
-        self.motor_linearity = 1.0
-        self.prop_max_rot = 433.3
+        self.filtered_thrust = torch.zeros((self._num_envs, 4), dtype=torch.float32, device=self._device)
+        self.applied_cmd = torch.zeros((self._num_envs, 4), dtype=torch.float32, device=self._device)
+        self.thrust_hist = torch.zeros((self.hist_len, self._num_envs, 4), dtype=torch.float32, device=self._device)
 
         self.target_positions = torch.zeros((self._num_envs, 3), dtype=torch.float32, device=self._device)
         self.target_positions[:, 2] = 1.0
         self.actions = torch.zeros((self._num_envs, 4), dtype=torch.float32, device=self._device)
         self.prev_actions = torch.zeros((self._num_envs, 4), dtype=torch.float32, device=self._device)
+        self.prev_raw_actions = torch.zeros((self._num_envs, 4), dtype=torch.float32, device=self._device)
+        self.action_diff_prev = torch.zeros((self._num_envs, 4), dtype=torch.float32, device=self._device)
 
         self.all_indices = torch.arange(self._num_envs, dtype=torch.int32, device=self._device)
 
-        # logs
         def torch_zeros():
             return torch.zeros(self._num_envs, dtype=torch.float32, device=self._device, requires_grad=False)
 
@@ -261,7 +337,6 @@ class CrazyflieTask(RLTask):
             "raw_spin": torch_zeros(),
         }
 
-        # cache state views
         self.root_pos, self.root_rot = self._copters.get_world_poses()
         self.root_velocities = self._copters.get_velocities()
         self.dof_pos = self._copters.get_joint_positions()
@@ -270,7 +345,6 @@ class CrazyflieTask(RLTask):
         self.initial_ball_pos, self.initial_ball_rot = self._balls.get_world_poses(clone=False)
         self.initial_root_pos, self.initial_root_rot = self.root_pos.clone(), self.root_rot.clone()
 
-        # curriculum + dwell
         self.hover_dwell = torch.zeros(self._num_envs, dtype=torch.float32, device=self._device)
 
         self.set_targets(self.all_indices)
@@ -308,21 +382,39 @@ class CrazyflieTask(RLTask):
 
         self.reset_buf[env_ids] = 0
         self.progress_buf[env_ids] = 0
+
+        # clear control/filters for these envs
         self.thrust_cmds_damp[env_ids] = 0.0
         self.thrust_rot_damp[env_ids] = 0.0
+        self.filtered_thrust[env_ids] = 0.0
+        self.applied_cmd[env_ids] = 0.0
         self.prev_actions[env_ids] = 0.0
+        self.prev_raw_actions[env_ids] = 0.0
+        self.action_diff_prev[env_ids] = 0.0
         self.hover_dwell[env_ids] = 0.0
+        self.thrust_hist[:, env_ids, :] = 0.0
 
-        # re-randomize per reset
-        asym = 1.0 + 0.05 * torch.randn(len(env_ids), 4, device=self._device)
-        asym = torch.clamp(asym, 0.8, 1.2)
-        asym = 4.0 * (asym / (torch.sum(asym, dim=1, keepdim=True) + EPS))
-        self.motor_asym_env[env_ids] = asym
+        # re-randomize per reset (off for baseline hover)
+        if self.enable_domain_rand:
+            asym = 1.0 + 0.05 * torch.randn(len(env_ids), 4, device=self._device)
+            asym = torch.clamp(asym, 0.8, 1.2)
+            asym = 4.0 * (asym / (torch.sum(asym, dim=1, keepdim=True) + EPS))
+            self.motor_asym_env[env_ids] = asym
+            mass_env = self.mass * torch.clamp(1.0 + 0.10 * torch.randn(len(env_ids), device=self._device), 0.9, 1.1)
+            ttw_env = self.thrust_to_weight * torch.clamp(1.0 + 0.15 * torch.randn(len(env_ids), device=self._device), 0.7, 1.3)
+        else:
+            asym = torch.ones(len(env_ids), 4, device=self._device)
+            self.motor_asym_env[env_ids] = asym
+            mass_env = torch.full((len(env_ids),), self.mass, device=self._device)
+            ttw_env = torch.full((len(env_ids),), self.thrust_to_weight, device=self._device)
 
-        mass_env = self.mass * torch.clamp(1.0 + 0.10 * torch.randn(len(env_ids), device=self._device), 0.9, 1.1)
-        ttw_env = self.thrust_to_weight * torch.clamp(1.0 + 0.15 * torch.randn(len(env_ids), device=self._device), 0.7, 1.3)
         thrust_max_env = (self.grav_z * mass_env * ttw_env).unsqueeze(-1) * (asym / 4.0)
         self.thrust_max[env_ids] = thrust_max_env.to(torch.float32)
+
+        # update hover fraction for these envs
+        total_thrust_max_scalar = torch.sum(self.thrust_max[env_ids].squeeze(-1), dim=1)  # [num_resets]
+        self.u_hover_frac[env_ids] = (self.mass * self.grav_z) / (total_thrust_max_scalar + 1e-6)
+        self.u_hover_frac[env_ids] = torch.clamp(self.u_hover_frac[env_ids], 0.35, 0.65)
 
         self.extras["episode"] = {}
         for key in self.episode_sums.keys():
@@ -331,83 +423,84 @@ class CrazyflieTask(RLTask):
 
     # ----------------------- rewards & terminations ---------------------- #
     def _attitude_error_reward(self, quats):
-        # use body-Z alignment and small yaw weight (stable, sim2real-friendly)
-        # up = body z in world; forward = body x in world
-        up = quat_axis(quats, 2)          # [E,3]
-        fwd = quat_axis(quats, 0)         # [E,3]
-        up_term = torch.clamp(up[..., 2], 0.0, 1.0)  # align with world +Z
-        yaw_term = torch.clamp(fwd[..., 0], -1.0, 1.0)  # prefer no yaw drift
-        return 0.8 * up_term + 0.2 * (yaw_term + 1.0) * 0.5  # map to [0,1]
+        up = quat_axis(quats, 2)     # body Z
+        fwd = quat_axis(quats, 0)    # body X
+        up_term = torch.clamp(up[..., 2], 0.0, 1.0)
+        yaw_term = torch.clamp(fwd[..., 0], -1.0, 1.0)
+        return 0.8 * up_term + 0.2 * (yaw_term + 1.0) * 0.5
 
     def calculate_metrics(self) -> None:
-        # state
         root_positions = self.root_pos - self._env_pos
         root_quats = self.root_rot
         root_vels = self.root_velocities
         root_angvels = root_vels[:, 3:]
 
-        # errors
         pos_err = self.target_positions - root_positions
-        pos_err_xy = pos_err[:, :2]
-        err_xy = torch.norm(pos_err_xy, dim=-1)
+        err_xy = torch.norm(pos_err[:, :2], dim=-1)
         err_z = torch.abs(pos_err[:, 2])
         dist_3d = torch.sqrt(torch.square(pos_err).sum(-1))
 
-        # curriculum: shrink tolerances over the episode
         prog = torch.clamp(self.progress_buf.to(torch.float32) / float(max(self._max_episode_length, 1)), 0.0, 1.0)
-        tol_xy = 0.50 - 0.40 * prog     # 0.50 → 0.10 m
-        tol_z = 0.40 - 0.30 * prog      # 0.40 → 0.10 m
+        tol_xy = 0.50 - 0.40 * prog
+        tol_z = 0.40 - 0.30 * prog
 
-        # closeness
         pos3d_reward = 1.0 / (1.0 + dist_3d)
         pos_xy_reward = torch.exp(-2.0 * err_xy)
         pos_z_reward = torch.exp(-6.0 * err_z)
 
-        # attitude
         up_reward = self._attitude_error_reward(root_quats)
 
-        # rates/effort
         vel_xy = torch.norm(root_vels[:, :2], dim=-1)
         vz = root_vels[:, 2]
         effort = torch.square(self.actions).sum(-1)
         spin = torch.square(root_angvels).sum(-1)
 
-        # lateral thrust preference
         net_force_world = torch.sum(self.thrusts, dim=1)
         lateral_force = torch.norm(net_force_world[:, :2], dim=-1)
         lateral_force_norm = lateral_force / (self.mass * self.grav_z + 1e-6)
 
-        # smoothness
+        # action smoothness + jerk (CAPS-style)
         act_smooth_pen = torch.square(self.action_diff).sum(-1) if hasattr(self, "action_diff") else 0.0
+        if hasattr(self, "action_diff_prev"):
+            jerk_pen = torch.square(self.action_diff - self.action_diff_prev).sum(-1)
+        else:
+            jerk_pen = 0.0
+        self.action_diff_prev = getattr(self, "action_diff", torch.zeros_like(self.prev_actions))
 
-        # takeoff gating
+        # high-frequency penalty from history (optionally disabled early)
+        if hasattr(self, "thrust_hist") and self.hist_len > 1 and self.hf_penalty_enabled:
+            diffs = self.thrust_hist[:-1] - self.thrust_hist[1:]            # [H-1,E,4]
+            hf_energy = torch.square(diffs).sum(dim=(0, 2)) / float(self.hist_len - 1)  # [E]
+        else:
+            hf_energy = 0.0
+
+        # signed z-error velocity shaping: drive toward target and settle
+        z_err = pos_err[:, 2]  # z - z_tgt
+        desired_vz = -0.8 * torch.tanh(z_err)          # cap approach speed ~0.8 m/s
+        r_zdir = -torch.abs(vz - desired_vz)           # best when vz ≈ desired_vz
+
         z = root_positions[:, 2]
-        takeoff_gate = (z < 0.6).float()
-        up_vel_reward = torch.clamp(vz, min=0.0)
 
-        # hover dwell bonus (consecutive steps in small box)
         within_xy = (err_xy < torch.clamp(tol_xy, min=0.08)).float()
         within_z = (err_z < torch.clamp(tol_z, min=0.08)).float()
         within_ang = (up_reward > 0.95).float()
         in_box = within_xy * within_z * within_ang
-        self.hover_dwell = torch.where(in_box > 0.5, self.hover_dwell + 1.0, torch.zeros_like(self.hover_dwell))
-        dwell_bonus = torch.clamp(self.hover_dwell, 0.0, 200.0) / 200.0  # ↑ over time, capped
+        self.hover_dwell = torch.where(in_box > 0.5, self.hover_dwell + 1.0, torch.zeros_like(in_box))
+        dwell_bonus = torch.clamp(self.hover_dwell, 0.0, 200.0) / 200.0
 
-        # vertical settling near target z
-        near_z_gate = (err_z < 0.20).float()
-        vz_settle_pen = near_z_gate * torch.abs(vz)
-
-        # thrust balance near hover
         near_hover_gate = ((err_xy < 0.20) & (z > 0.8)).float()
-        per_motor_mag = torch.norm(self.thrusts, dim=-1)  # [E,4]
+        per_motor_mag = torch.norm(self.thrusts, dim=-1)
         thrust_imbalance_pen = near_hover_gate * torch.var(per_motor_mag, dim=-1)
 
-        # weights (tuned for steady hover)
+        # weights
         w_pos3d, w_xy, w_z = 1.0, 1.2, 1.2
         w_att, w_spin = 0.9, 0.2
         w_velxy, w_lat = 0.03, 0.03
-        w_eff, w_act = 0.01, 0.005
-        w_takeup, w_vz_settle, w_dwell, w_imb = 0.05, 0.05, 0.10, 0.02
+        w_eff, w_act = 0.01, 0.010
+        w_jerk = 0.010
+        w_hf = 0.020 if self.hf_penalty_enabled else 0.0
+        w_zdir = 0.3
+        w_dwell, w_imb = 0.10, 0.02
 
         self.rew_buf[:] = (
             w_pos3d * pos3d_reward
@@ -419,13 +512,13 @@ class CrazyflieTask(RLTask):
             - w_lat * lateral_force_norm
             - w_eff * effort
             - w_act * act_smooth_pen
-            + w_takeup * takeoff_gate * up_vel_reward
-            - w_vz_settle * vz_settle_pen
+            - w_jerk * jerk_pen
+            - w_hf * hf_energy
+            + w_zdir * r_zdir
             - w_imb * thrust_imbalance_pen
             + w_dwell * dwell_bonus
         )
 
-        # logs/termination vars
         self.target_dist = dist_3d
         self.root_positions = root_positions
         self.orient_z = quat_axis(root_quats, 2)[..., 2]
@@ -445,18 +538,19 @@ class CrazyflieTask(RLTask):
 
         die = torch.where(self.target_dist > 5.0, ones, die)
 
-        # grace for takeoff
         grace = self.progress_buf < int(1.5 / self.dt)
         low_floor_now = self.root_positions[..., 2] < 0.0
         low_floor_later = self.root_positions[..., 2] < 0.5
         die = torch.where(grace & low_floor_now, ones, die)
         die = torch.where(~grace & low_floor_later, ones, die)
 
-        # ceiling / flipped
+        # ceiling tied to target to avoid extended climb bias
+        too_high = self.root_positions[..., 2] > (self.target_positions[..., 2] + 0.8)
+        die = torch.where(too_high, ones, die)
+
         die = torch.where(self.root_positions[..., 2] > 5.0, ones, die)
         die = torch.where(self.orient_z < 0.0, ones, die)
 
-        # soft XY boundary
         xy_radius = torch.norm(self.root_positions[..., :2], dim=-1)
         die = torch.where(xy_radius > 2.0, ones, die)
 
